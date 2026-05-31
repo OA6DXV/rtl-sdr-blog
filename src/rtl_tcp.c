@@ -462,33 +462,27 @@ static void configure_device(rtlsdr_dev_t *_dev, int direct_sampling,
 }
 
 /* Report whether the open device still responds on the USB bus.
- * Performs a live control transfer (reading the USB string descriptors) so a
- * stale handle - e.g. after the dongle was unplugged and re-enumerated at a
- * new address - is detected as well, not just a clean LIBUSB_ERROR_NO_DEVICE.
- * This does not change any radio settings. */
+ * Re-applies the current center frequency, which performs real USB control /
+ * I2C transfers and - crucially - returns a status we can check. We must NOT
+ * use rtlsdr_get_usb_strings() here: it reads the cached device descriptor and
+ * returns 0 even when the device is gone, producing a false "alive" result.
+ * A stale handle (dongle unplugged, or re-enumerated at a new address) makes
+ * these transfers fail with LIBUSB_ERROR_NO_DEVICE, which is exactly what we
+ * want to detect. Re-tuning to the same frequency changes no radio setting. */
 static int device_is_alive(void)
 {
-	char serial[256] = "";
-
 	if (!dev)
 		return 0;
 
-	rtlsdr_get_usb_strings(dev, NULL, NULL, serial);
-
-	if (dev_serial[0] != '\0')
-		return (strcmp(serial, dev_serial) == 0);
-
-	/* Device has no serial number: fall back to a benign control transfer
-	 * that re-applies the current frequency (no functional change). */
 	return (rtlsdr_set_center_freq(dev, rtlsdr_get_center_freq(dev)) >= 0);
 }
 
 static void recovery_sleep(void)
 {
 #ifdef _WIN32
-	Sleep(2000);
+	Sleep(5000);
 #else
-	usleep(2000000);
+	usleep(5000000);
 #endif
 }
 
@@ -581,6 +575,11 @@ int main(int argc, char **argv)
 #else
 	struct sigaction sigact, sigign;
 #endif
+
+	/* Line-buffer stdout so log messages appear in real time under systemd
+	 * (otherwise printf() output is block-buffered and only flushed in bursts,
+	 * e.g. when the service stops, which makes the logs very hard to read). */
+	setvbuf(stdout, NULL, _IOLBF, 0);
 
 	while ((opt = getopt(argc, argv, "a:p:f:g:s:b:n:d:P:TDR")) != -1) {
 		switch (opt) {
@@ -733,7 +732,14 @@ int main(int argc, char **argv)
 			r = select(listensocket+1, &readfds, NULL, NULL, &tv);
 			if(shutdown_requested) {
 				goto out;
-			} else if(r) {
+			}
+
+			if (enable_reconnect && !shutdown_requested && dev && !device_is_alive()) {
+				if (reconnect_device(direct_sampling, ppm_error, samp_rate, frequency, gain, enable_biastee) < 0)
+					goto out;
+			}
+
+			else if(r) {
 				rlen = sizeof(remote);
 				s = accept(listensocket,(struct sockaddr *)&remote, &rlen);
 				break;
