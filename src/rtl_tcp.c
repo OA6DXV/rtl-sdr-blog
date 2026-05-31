@@ -59,6 +59,8 @@ typedef int socklen_t;
 #define DEFAULT_PORT_STR "1234"
 #define DEFAULT_SAMPLE_RATE_HZ 2048000
 #define DEFAULT_MAX_NUM_BUFFERS 500
+#define DATA_CLIENT_SEND_TIMEOUT_US 250000
+#define DATA_CLIENT_SNDBUF_BYTES (1024 * 1024)
 
 static SOCKET s;
 
@@ -226,8 +228,10 @@ static void set_socket_nonblock(SOCKET socket)
 static void add_data_client(SOCKET client)
 {
 	SOCKET *new_clients;
-	int r;
+	int r, sndbuf;
 
+	sndbuf = DATA_CLIENT_SNDBUF_BYTES;
+	setsockopt(client, SOL_SOCKET, SO_SNDBUF, (char *)&sndbuf, sizeof(sndbuf));
 	set_socket_nonblock(client);
 
 	pthread_mutex_lock(&clients_mutex);
@@ -291,7 +295,7 @@ static void send_data_to_clients(char *data, size_t len)
 
 		while (offset < len) {
 			tv.tv_sec = 0;
-			tv.tv_usec = 10000;
+			tv.tv_usec = DATA_CLIENT_SEND_TIMEOUT_US;
 
 			FD_ZERO(&writefds);
 			FD_SET(data_clients[i], &writefds);
