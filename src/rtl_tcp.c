@@ -72,9 +72,15 @@ static pthread_mutex_t exit_cond_lock;
 static pthread_mutex_t ll_mutex;
 static pthread_cond_t cond;
 
+typedef struct {
+	SOCKET socket;
+	char host[NI_MAXHOST];
+	char port[NI_MAXSERV];
+} data_client_t;
+
 static pthread_mutex_t clients_mutex;
 static SOCKET listensocket_data = 0;
-static SOCKET *data_clients = NULL;
+static data_client_t *data_clients = NULL;
 static int data_client_count = 0;
 static int data_client_capacity = 0;
 static const char *data_port = NULL;
@@ -225,10 +231,17 @@ static void set_socket_nonblock(SOCKET socket)
 #endif
 }
 
-static void add_data_client(SOCKET client)
+static void add_data_client(SOCKET client, struct sockaddr *remote, socklen_t rlen)
 {
-	SOCKET *new_clients;
+	data_client_t *new_clients;
 	int r, sndbuf;
+	char host[NI_MAXHOST] = "unknown";
+	char port[NI_MAXSERV] = "unknown";
+
+	r = getnameinfo(remote, rlen, host, NI_MAXHOST, port, NI_MAXSERV,
+			NI_NUMERICSERV | NI_NUMERICHOST);
+	if (r)
+		snprintf(host, sizeof(host), "unknown");
 
 	sndbuf = DATA_CLIENT_SNDBUF_BYTES;
 	setsockopt(client, SOL_SOCKET, SO_SNDBUF, (char *)&sndbuf, sizeof(sndbuf));
@@ -238,7 +251,7 @@ static void add_data_client(SOCKET client)
 
 	if (data_client_count >= data_client_capacity) {
 		data_client_capacity = data_client_capacity == 0 ? 10 : data_client_capacity * 2;
-		new_clients = realloc(data_clients, sizeof(SOCKET) * data_client_capacity);
+		new_clients = realloc(data_clients, sizeof(data_client_t) * data_client_capacity);
 		if (!new_clients) {
 			data_client_capacity = data_client_count;
 			pthread_mutex_unlock(&clients_mutex);
@@ -249,13 +262,20 @@ static void add_data_client(SOCKET client)
 		data_clients = new_clients;
 	}
 
-	data_clients[data_client_count++] = client;
+	data_clients[data_client_count].socket = client;
+	snprintf(data_clients[data_client_count].host,
+		 sizeof(data_clients[data_client_count].host), "%s", host);
+	snprintf(data_clients[data_client_count].port,
+		 sizeof(data_clients[data_client_count].port), "%s", port);
+	data_client_count++;
 
 	r = send(client, (const char *)&dongle_info, (int)sizeof(dongle_info), 0);
 	if (sizeof(dongle_info) != r)
-		printf("failed to send dongle information to data client\n");
+		printf("failed to send dongle information to data client %s:%s\n",
+		       host, port);
 
-	printf("data client accepted! total: %d\n", data_client_count);
+	printf("data client accepted from %s:%s! total: %d\n",
+	       host, port, data_client_count);
 	pthread_mutex_unlock(&clients_mutex);
 }
 
@@ -273,7 +293,7 @@ static void accept_data_clients(void)
 		client = accept(listensocket_data, (struct sockaddr *)&remote, &rlen);
 		if (client == SOCKET_ERROR)
 			break;
-		add_data_client(client);
+		add_data_client(client, (struct sockaddr *)&remote, rlen);
 	}
 }
 
@@ -298,14 +318,14 @@ static void send_data_to_clients(char *data, size_t len)
 			tv.tv_usec = DATA_CLIENT_SEND_TIMEOUT_US;
 
 			FD_ZERO(&writefds);
-			FD_SET(data_clients[i], &writefds);
-			r = select(data_clients[i]+1, NULL, &writefds, NULL, &tv);
+			FD_SET(data_clients[i].socket, &writefds);
+			r = select(data_clients[i].socket+1, NULL, &writefds, NULL, &tv);
 
 			if (r <= 0) {
 				break;
 			}
 
-			sent = send(data_clients[i], &data[offset], (int)(len - offset), 0);
+			sent = send(data_clients[i].socket, &data[offset], (int)(len - offset), 0);
 			if (sent <= 0) {
 #ifdef _WIN32
 				if (WSAGetLastError() == WSAEWOULDBLOCK)
@@ -314,9 +334,10 @@ static void send_data_to_clients(char *data, size_t len)
 				if (errno == EAGAIN || errno == EWOULDBLOCK)
 					break;
 #endif
-				printf("data client socket bye\n");
-				closesocket(data_clients[i]);
-				data_clients[i] = SOCKET_ERROR;
+				printf("data client %s:%s socket bye\n",
+				       data_clients[i].host, data_clients[i].port);
+				closesocket(data_clients[i].socket);
+				data_clients[i].socket = SOCKET_ERROR;
 				removed = 1;
 				break;
 			}
@@ -325,12 +346,14 @@ static void send_data_to_clients(char *data, size_t len)
 		}
 
 		if (removed)
-			printf("data clients remaining: %d\n", data_client_count - 1);
+			printf("data clients remaining after %s:%s disconnected: %d\n",
+			       data_clients[i].host, data_clients[i].port,
+			       data_client_count - 1);
 	}
 
 	new_count = 0;
 	for (i = 0; i < data_client_count; i++) {
-		if (data_clients[i] != SOCKET_ERROR)
+		if (data_clients[i].socket != SOCKET_ERROR)
 			data_clients[new_count++] = data_clients[i];
 	}
 	data_client_count = new_count;
@@ -1081,7 +1104,7 @@ out:
 	if (enable_data_port) {
 		closesocket(listensocket_data);
 		for (client_index = 0; client_index < data_client_count; client_index++)
-			closesocket(data_clients[client_index]);
+			closesocket(data_clients[client_index].socket);
 		free(data_clients);
 	}
 #ifdef _WIN32
