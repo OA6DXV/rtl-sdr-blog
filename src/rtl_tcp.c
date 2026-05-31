@@ -59,6 +59,8 @@ typedef int socklen_t;
 #define DEFAULT_PORT_STR "1234"
 #define DEFAULT_SAMPLE_RATE_HZ 2048000
 #define DEFAULT_MAX_NUM_BUFFERS 500
+#define DATA_CLIENT_SEND_TIMEOUT_US 250000
+#define DATA_CLIENT_SNDBUF_BYTES (1024 * 1024)
 
 static SOCKET s;
 
@@ -69,6 +71,21 @@ static pthread_mutex_t exit_cond_lock;
 
 static pthread_mutex_t ll_mutex;
 static pthread_cond_t cond;
+
+typedef struct {
+	SOCKET socket;
+	char host[NI_MAXHOST];
+	char port[NI_MAXSERV];
+} data_client_t;
+
+static pthread_mutex_t clients_mutex;
+static SOCKET listensocket_data = 0;
+static data_client_t *data_clients = NULL;
+static int data_client_count = 0;
+static int data_client_capacity = 0;
+static const char *data_port = NULL;
+static int enable_data_port = 0;
+static volatile int master_connected = 0;
 
 struct llist {
 	char *data;
@@ -83,6 +100,7 @@ typedef struct { /* structure size must be multiple of 2 bytes */
 } dongle_info_t;
 
 static rtlsdr_dev_t *dev = NULL;
+static dongle_info_t dongle_info;
 
 static int enable_biastee = 0;
 static int global_numq = 0;
@@ -106,7 +124,8 @@ void usage(void)
 {
 	printf("rtl_tcp, an I/Q spectrum server for RTL2832 based DVB-T receivers\n\n");
 	printf("Usage:\t[-a listen address]\n");
-	printf("\t[-p listen port (default: %s)]\n", DEFAULT_PORT_STR);
+	printf("\t[-p listen port for master client with control commands (default: %s)]\n", DEFAULT_PORT_STR);
+	printf("\t[-l listen port for read-only I/Q data clients (multiple clients allowed)]\n");
 	printf("\t[-f frequency to tune to [Hz]]\n");
 	printf("\t[-g gain (default: 0 for auto)]\n");
 	printf("\t[-s samplerate in Hz (default: %d Hz)]\n", DEFAULT_SAMPLE_RATE_HZ);
@@ -117,6 +136,9 @@ void usage(void)
 	printf("\t[-T enable bias-T on GPIO PIN 0 (works for rtl-sdr.com v3/v4 dongles)]\n");
 	printf("\t[-D enable direct sampling (default: off)]\n");
 	printf("\t[-R automatically recover/reconnect if the device disconnects (e.g. power loss)]\n");
+	printf("\nExample:\trtl_tcp -a 0.0.0.0 -p 1234 -l 1235\n");
+	printf("\t\tPort 1234: Master client with full control (frequency, gain, ...)\n");
+	printf("\t\tPort 1235: Read-only I/Q stream clients (multiple connections)\n");
 	exit(1);
 }
 
@@ -179,6 +201,226 @@ static void stop_session(void)
 	rtlsdr_cancel_async(dev);
 }
 
+static void refresh_dongle_info(void)
+{
+	int r;
+
+	memset(&dongle_info, 0, sizeof(dongle_info));
+	memcpy(&dongle_info.magic, "RTL0", 4);
+
+	r = rtlsdr_get_tuner_type(dev);
+	if (r >= 0)
+		dongle_info.tuner_type = htonl(r);
+
+	r = rtlsdr_get_tuner_gains(dev, NULL);
+	if (r >= 0)
+		dongle_info.tuner_gain_count = htonl(r);
+}
+
+static void set_socket_nonblock(SOCKET socket)
+{
+#ifdef _WIN32
+	u_long blockmode = 1;
+	ioctlsocket(socket, FIONBIO, &blockmode);
+#else
+	int r;
+
+	r = fcntl(socket, F_GETFL, 0);
+	if (r >= 0)
+		fcntl(socket, F_SETFL, r | O_NONBLOCK);
+#endif
+}
+
+static void add_data_client(SOCKET client, struct sockaddr *remote, socklen_t rlen)
+{
+	data_client_t *new_clients;
+	int r, sndbuf;
+	char host[NI_MAXHOST] = "unknown";
+	char port[NI_MAXSERV] = "unknown";
+
+	r = getnameinfo(remote, rlen, host, NI_MAXHOST, port, NI_MAXSERV,
+			NI_NUMERICSERV | NI_NUMERICHOST);
+	if (r)
+		snprintf(host, sizeof(host), "unknown");
+
+	sndbuf = DATA_CLIENT_SNDBUF_BYTES;
+	setsockopt(client, SOL_SOCKET, SO_SNDBUF, (char *)&sndbuf, sizeof(sndbuf));
+	set_socket_nonblock(client);
+
+	pthread_mutex_lock(&clients_mutex);
+
+	if (data_client_count >= data_client_capacity) {
+		data_client_capacity = data_client_capacity == 0 ? 10 : data_client_capacity * 2;
+		new_clients = realloc(data_clients, sizeof(data_client_t) * data_client_capacity);
+		if (!new_clients) {
+			data_client_capacity = data_client_count;
+			pthread_mutex_unlock(&clients_mutex);
+			closesocket(client);
+			fprintf(stderr, "failed to allocate data client list\n");
+			return;
+		}
+		data_clients = new_clients;
+	}
+
+	data_clients[data_client_count].socket = client;
+	snprintf(data_clients[data_client_count].host,
+		 sizeof(data_clients[data_client_count].host), "%s", host);
+	snprintf(data_clients[data_client_count].port,
+		 sizeof(data_clients[data_client_count].port), "%s", port);
+	data_client_count++;
+
+	r = send(client, (const char *)&dongle_info, (int)sizeof(dongle_info), 0);
+	if (sizeof(dongle_info) != r)
+		printf("failed to send dongle information to data client %s:%s\n",
+		       host, port);
+
+	printf("data client accepted from %s:%s! total: %d\n",
+	       host, port, data_client_count);
+	pthread_mutex_unlock(&clients_mutex);
+}
+
+static void accept_data_clients(void)
+{
+	SOCKET client;
+	struct sockaddr_storage remote;
+	socklen_t rlen;
+
+	if (!enable_data_port)
+		return;
+
+	while (!do_exit && !shutdown_requested) {
+		rlen = sizeof(remote);
+		client = accept(listensocket_data, (struct sockaddr *)&remote, &rlen);
+		if (client == SOCKET_ERROR)
+			break;
+		add_data_client(client, (struct sockaddr *)&remote, rlen);
+	}
+}
+
+static void send_data_to_clients(char *data, size_t len)
+{
+	fd_set writefds;
+	struct timeval tv;
+	size_t offset;
+	int i, r, sent, new_count, removed;
+
+	if (!enable_data_port || data_client_count <= 0)
+		return;
+
+	pthread_mutex_lock(&clients_mutex);
+
+	for (i = 0; i < data_client_count; i++) {
+		offset = 0;
+		removed = 0;
+
+		while (offset < len) {
+			tv.tv_sec = 0;
+			tv.tv_usec = DATA_CLIENT_SEND_TIMEOUT_US;
+
+			FD_ZERO(&writefds);
+			FD_SET(data_clients[i].socket, &writefds);
+			r = select(data_clients[i].socket+1, NULL, &writefds, NULL, &tv);
+
+			if (r <= 0) {
+				break;
+			}
+
+			sent = send(data_clients[i].socket, &data[offset], (int)(len - offset), 0);
+			if (sent <= 0) {
+#ifdef _WIN32
+				if (WSAGetLastError() == WSAEWOULDBLOCK)
+					break;
+#else
+				if (errno == EAGAIN || errno == EWOULDBLOCK)
+					break;
+#endif
+				printf("data client %s:%s socket bye\n",
+				       data_clients[i].host, data_clients[i].port);
+				closesocket(data_clients[i].socket);
+				data_clients[i].socket = SOCKET_ERROR;
+				removed = 1;
+				break;
+			}
+
+			offset += sent;
+		}
+
+		if (removed)
+			printf("data clients remaining after %s:%s disconnected: %d\n",
+			       data_clients[i].host, data_clients[i].port,
+			       data_client_count - 1);
+	}
+
+	new_count = 0;
+	for (i = 0; i < data_client_count; i++) {
+		if (data_clients[i].socket != SOCKET_ERROR)
+			data_clients[new_count++] = data_clients[i];
+	}
+	data_client_count = new_count;
+
+	pthread_mutex_unlock(&clients_mutex);
+}
+
+static int has_data_clients(void)
+{
+	int has_clients;
+
+	if (!enable_data_port)
+		return 0;
+
+	pthread_mutex_lock(&clients_mutex);
+	has_clients = data_client_count > 0;
+	pthread_mutex_unlock(&clients_mutex);
+
+	return has_clients;
+}
+
+static void send_data_to_master(char *data, size_t len)
+{
+	int bytesleft, bytessent, index;
+	struct timeval tv = {1, 0};
+	fd_set writefds;
+	int r;
+
+	if (!master_connected)
+		return;
+
+	bytesleft = len;
+	index = 0;
+	bytessent = 0;
+
+	while(bytesleft > 0) {
+		FD_ZERO(&writefds);
+		FD_SET(s, &writefds);
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+		r = select(s+1, NULL, &writefds, NULL, &tv);
+		if(r) {
+			bytessent = send(s, &data[index], bytesleft, 0);
+			if(bytessent <= 0) {
+				printf("worker socket bye\n");
+				master_connected = 0;
+				if (!has_data_clients()) {
+					stop_session();
+					pthread_exit(NULL);
+				}
+				break;
+			}
+			bytesleft -= bytessent;
+			index += bytessent;
+		}
+		if(bytessent == SOCKET_ERROR || do_exit) {
+			printf("worker socket bye\n");
+			master_connected = 0;
+			if (!has_data_clients()) {
+				stop_session();
+				pthread_exit(NULL);
+			}
+			break;
+		}
+	}
+}
+
 void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 {
 	if(!do_exit) {
@@ -227,11 +469,8 @@ void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 static void *tcp_worker(void *arg)
 {
 	struct llist *curelem,*prev;
-	int bytesleft,bytessent, index;
-	struct timeval tv= {1,0};
 	struct timespec ts;
 	struct timeval tp;
-	fd_set writefds;
 	int r = 0;
 
 	while(1) {
@@ -255,26 +494,9 @@ static void *tcp_worker(void *arg)
 		pthread_mutex_unlock(&ll_mutex);
 
 		while(curelem != 0) {
-			bytesleft = curelem->len;
-			index = 0;
-			bytessent = 0;
-			while(bytesleft > 0) {
-				FD_ZERO(&writefds);
-				FD_SET(s, &writefds);
-				tv.tv_sec = 1;
-				tv.tv_usec = 0;
-				r = select(s+1, NULL, &writefds, NULL, &tv);
-				if(r) {
-					bytessent = send(s,  &curelem->data[index], bytesleft, 0);
-					bytesleft -= bytessent;
-					index += bytessent;
-				}
-				if(bytessent == SOCKET_ERROR || do_exit) {
-						printf("worker socket bye\n");
-						stop_session();
-						pthread_exit(NULL);
-				}
-			}
+			send_data_to_master(curelem->data, curelem->len);
+			accept_data_clients();
+			send_data_to_clients(curelem->data, curelem->len);
 			prev = curelem;
 			curelem = curelem->next;
 			free(prev->data);
@@ -331,10 +553,18 @@ static void *command_worker(void *arg)
 			r = select(s+1, &readfds, NULL, NULL, &tv);
 			if(r) {
 				received = recv(s, (char*)&cmd+(sizeof(cmd)-left), left, 0);
+				if(received <= 0) {
+					printf("comm recv bye\n");
+					master_connected = 0;
+					if (!has_data_clients())
+						stop_session();
+					pthread_exit(NULL);
+				}
 				left -= received;
 			}
 			if(received == SOCKET_ERROR || do_exit) {
 				printf("comm recv bye\n");
+				master_connected = 0;
 				stop_session();
 				pthread_exit(NULL);
 			}
@@ -524,6 +754,7 @@ static int reconnect_device(int direct_sampling, int ppm_error,
 				configure_device(dev, direct_sampling, ppm_error,
 						 samp_rate, frequency, gain,
 						 biastee);
+				refresh_dongle_info();
 				return 0;
 			}
 			if (dev) {
@@ -548,11 +779,15 @@ int main(int argc, char **argv)
 	struct addrinfo *ai;
 	struct addrinfo *aiHead;
 	struct addrinfo  hints = { 0 };
+	struct addrinfo *aiData;
+	struct addrinfo *aiDataHead = NULL;
+	struct addrinfo  hintsData = { 0 };
 	char hostinfo[NI_MAXHOST];
 	char portinfo[NI_MAXSERV];
 	char remhostinfo[NI_MAXHOST];
 	char remportinfo[NI_MAXSERV];
 	int aiErr;
+	int client_index;
 	uint32_t buf_num = 0;
 	int dev_index = 0;
 	int dev_given = 0;
@@ -568,7 +803,6 @@ int main(int argc, char **argv)
 	socklen_t rlen;
 	fd_set readfds;
 	u_long blockmode = 1;
-	dongle_info_t dongle_info;
 #ifdef _WIN32
 	WSADATA wsd;
 	i = WSAStartup(MAKEWORD(2,2), &wsd);
@@ -581,7 +815,7 @@ int main(int argc, char **argv)
 	 * e.g. when the service stops, which makes the logs very hard to read). */
 	setvbuf(stdout, NULL, _IOLBF, 0);
 
-	while ((opt = getopt(argc, argv, "a:p:f:g:s:b:n:d:P:TDR")) != -1) {
+	while ((opt = getopt(argc, argv, "a:p:l:f:g:s:b:n:d:P:TDR")) != -1) {
 		switch (opt) {
 		case 'd':
 			dev_index = verbose_device_search(optarg);
@@ -601,6 +835,10 @@ int main(int argc, char **argv)
 			break;
 		case 'p':
 		        port = strdup(optarg);
+			break;
+		case 'l':
+		        data_port = strdup(optarg);
+			enable_data_port = 1;
 			break;
 		case 'b':
 			buf_num = atoi(optarg);
@@ -664,10 +902,11 @@ int main(int argc, char **argv)
 
 	configure_device(dev, direct_sampling, ppm_error, samp_rate, frequency,
 			 gain, enable_biastee);
+	refresh_dongle_info();
 
 	pthread_mutex_init(&exit_cond_lock, NULL);
 	pthread_mutex_init(&ll_mutex, NULL);
-	pthread_mutex_init(&exit_cond_lock, NULL);
+	pthread_mutex_init(&clients_mutex, NULL);
 	pthread_cond_init(&cond, NULL);
 	pthread_cond_init(&exit_cond, NULL);
 
@@ -715,6 +954,52 @@ int main(int argc, char **argv)
 	r = fcntl(listensocket, F_SETFL, r | O_NONBLOCK);
 #endif
 
+	if (enable_data_port) {
+		hintsData.ai_flags = AI_PASSIVE;
+		hintsData.ai_family = PF_UNSPEC;
+		hintsData.ai_socktype = SOCK_STREAM;
+		hintsData.ai_protocol = IPPROTO_TCP;
+
+		if ((aiErr = getaddrinfo(addr,
+					 data_port,
+					 &hintsData,
+					 &aiDataHead )) != 0)
+		{
+			fprintf(stderr, "data address %s ERROR - %s.\n",
+				addr, gai_strerror(aiErr));
+			return(-1);
+		}
+
+		for (aiData = aiDataHead; aiData != NULL; aiData = aiData->ai_next) {
+			listensocket_data = socket(aiData->ai_family,
+						   aiData->ai_socktype,
+						   aiData->ai_protocol);
+			if (listensocket_data < 0)
+				continue;
+
+			r = 1;
+			setsockopt(listensocket_data, SOL_SOCKET, SO_REUSEADDR, (char *)&r, sizeof(int));
+			setsockopt(listensocket_data, SOL_SOCKET, SO_LINGER, (char *)&ling, sizeof(ling));
+
+			if (bind(listensocket_data, aiData->ai_addr, aiData->ai_addrlen))
+				fprintf(stderr, "rtl_tcp data bind error: %s", strerror(errno));
+			else
+				break;
+
+			closesocket(listensocket_data);
+			listensocket_data = 0;
+		}
+
+		if (!listensocket_data) {
+			fprintf(stderr, "failed to bind data port %s\n", data_port);
+			return(-1);
+		}
+
+		set_socket_nonblock(listensocket_data);
+		listen(listensocket_data, 10);
+		freeaddrinfo(aiDataHead);
+	}
+
 	while(1) {
 		printf("listening...\n");
 		printf("Use the device argument 'rtl_tcp=%s:%s' in OsmoSDR "
@@ -722,14 +1007,19 @@ int main(int argc, char **argv)
 		       "to receive samples in GRC and control "
 		       "rtl_tcp parameters (frequency, gain, ...).\n",
 		       hostinfo, portinfo);
+		if (enable_data_port)
+			printf("Data port for read-only clients: %s\n", data_port);
 		listen(listensocket,1);
 
 		while(1) {
 			FD_ZERO(&readfds);
 			FD_SET(listensocket, &readfds);
+			if (enable_data_port)
+				FD_SET(listensocket_data, &readfds);
 			tv.tv_sec = 1;
 			tv.tv_usec = 0;
-			r = select(listensocket+1, &readfds, NULL, NULL, &tv);
+			r = select((listensocket_data > listensocket ? listensocket_data : listensocket)+1,
+				   &readfds, NULL, NULL, &tv);
 			if(shutdown_requested) {
 				goto out;
 			}
@@ -740,8 +1030,15 @@ int main(int argc, char **argv)
 			}
 
 			else if(r) {
+				if (enable_data_port && FD_ISSET(listensocket_data, &readfds))
+					accept_data_clients();
+
+				if (!FD_ISSET(listensocket, &readfds))
+					continue;
+
 				rlen = sizeof(remote);
 				s = accept(listensocket,(struct sockaddr *)&remote, &rlen);
+				master_connected = 1;
 				break;
 			}
 		}
@@ -753,16 +1050,7 @@ int main(int argc, char **argv)
 			    remportinfo, NI_MAXSERV, NI_NUMERICSERV);
 		printf("client accepted! %s %s\n", remhostinfo, remportinfo);
 
-		memset(&dongle_info, 0, sizeof(dongle_info));
-		memcpy(&dongle_info.magic, "RTL0", 4);
-
-		r = rtlsdr_get_tuner_type(dev);
-		if (r >= 0)
-			dongle_info.tuner_type = htonl(r);
-
-		r = rtlsdr_get_tuner_gains(dev, NULL);
-		if (r >= 0)
-			dongle_info.tuner_gain_count = htonl(r);
+		refresh_dongle_info();
 
 		r = send(s, (const char *)&dongle_info, sizeof(dongle_info), 0);
 		if (sizeof(dongle_info) != r)
@@ -780,6 +1068,7 @@ int main(int argc, char **argv)
 		pthread_join(command_thread, &status);
 
 		closesocket(s);
+		master_connected = 0;
 
 		printf("all threads dead..\n");
 		curelem = ll_buffers;
@@ -812,6 +1101,12 @@ out:
 		rtlsdr_close(dev);
 	closesocket(listensocket);
 	closesocket(s);
+	if (enable_data_port) {
+		closesocket(listensocket_data);
+		for (client_index = 0; client_index < data_client_count; client_index++)
+			closesocket(data_clients[client_index].socket);
+		free(data_clients);
+	}
 #ifdef _WIN32
 	WSACleanup();
 #endif
