@@ -314,6 +314,20 @@ static void send_data_to_clients(char *data, size_t len)
 	pthread_mutex_unlock(&clients_mutex);
 }
 
+static int has_data_clients(void)
+{
+	int has_clients;
+
+	if (!enable_data_port)
+		return 0;
+
+	pthread_mutex_lock(&clients_mutex);
+	has_clients = data_client_count > 0;
+	pthread_mutex_unlock(&clients_mutex);
+
+	return has_clients;
+}
+
 static void send_data_to_master(char *data, size_t len)
 {
 	int bytesleft, bytessent, index;
@@ -339,7 +353,7 @@ static void send_data_to_master(char *data, size_t len)
 			if(bytessent <= 0) {
 				printf("worker socket bye\n");
 				master_connected = 0;
-				if (!enable_data_port) {
+				if (!has_data_clients()) {
 					stop_session();
 					pthread_exit(NULL);
 				}
@@ -351,7 +365,7 @@ static void send_data_to_master(char *data, size_t len)
 		if(bytessent == SOCKET_ERROR || do_exit) {
 			printf("worker socket bye\n");
 			master_connected = 0;
-			if (!enable_data_port) {
+			if (!has_data_clients()) {
 				stop_session();
 				pthread_exit(NULL);
 			}
@@ -495,7 +509,7 @@ static void *command_worker(void *arg)
 				if(received <= 0) {
 					printf("comm recv bye\n");
 					master_connected = 0;
-					if (!enable_data_port)
+					if (!has_data_clients())
 						stop_session();
 					pthread_exit(NULL);
 				}
