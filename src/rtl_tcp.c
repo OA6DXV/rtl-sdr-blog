@@ -77,6 +77,7 @@ static int data_client_count = 0;
 static int data_client_capacity = 0;
 static const char *data_port = NULL;
 static int enable_data_port = 0;
+static volatile int master_connected = 0;
 
 struct llist {
 	char *data;
@@ -313,6 +314,52 @@ static void send_data_to_clients(char *data, size_t len)
 	pthread_mutex_unlock(&clients_mutex);
 }
 
+static void send_data_to_master(char *data, size_t len)
+{
+	int bytesleft, bytessent, index;
+	struct timeval tv = {1, 0};
+	fd_set writefds;
+	int r;
+
+	if (!master_connected)
+		return;
+
+	bytesleft = len;
+	index = 0;
+	bytessent = 0;
+
+	while(bytesleft > 0) {
+		FD_ZERO(&writefds);
+		FD_SET(s, &writefds);
+		tv.tv_sec = 1;
+		tv.tv_usec = 0;
+		r = select(s+1, NULL, &writefds, NULL, &tv);
+		if(r) {
+			bytessent = send(s, &data[index], bytesleft, 0);
+			if(bytessent <= 0) {
+				printf("worker socket bye\n");
+				master_connected = 0;
+				if (!enable_data_port) {
+					stop_session();
+					pthread_exit(NULL);
+				}
+				break;
+			}
+			bytesleft -= bytessent;
+			index += bytessent;
+		}
+		if(bytessent == SOCKET_ERROR || do_exit) {
+			printf("worker socket bye\n");
+			master_connected = 0;
+			if (!enable_data_port) {
+				stop_session();
+				pthread_exit(NULL);
+			}
+			break;
+		}
+	}
+}
+
 void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 {
 	if(!do_exit) {
@@ -361,11 +408,8 @@ void rtlsdr_callback(unsigned char *buf, uint32_t len, void *ctx)
 static void *tcp_worker(void *arg)
 {
 	struct llist *curelem,*prev;
-	int bytesleft,bytessent, index;
-	struct timeval tv= {1,0};
 	struct timespec ts;
 	struct timeval tp;
-	fd_set writefds;
 	int r = 0;
 
 	while(1) {
@@ -389,26 +433,7 @@ static void *tcp_worker(void *arg)
 		pthread_mutex_unlock(&ll_mutex);
 
 		while(curelem != 0) {
-			bytesleft = curelem->len;
-			index = 0;
-			bytessent = 0;
-			while(bytesleft > 0) {
-				FD_ZERO(&writefds);
-				FD_SET(s, &writefds);
-				tv.tv_sec = 1;
-				tv.tv_usec = 0;
-				r = select(s+1, NULL, &writefds, NULL, &tv);
-				if(r) {
-					bytessent = send(s,  &curelem->data[index], bytesleft, 0);
-					bytesleft -= bytessent;
-					index += bytessent;
-				}
-				if(bytessent == SOCKET_ERROR || do_exit) {
-						printf("worker socket bye\n");
-						stop_session();
-						pthread_exit(NULL);
-				}
-			}
+			send_data_to_master(curelem->data, curelem->len);
 			accept_data_clients();
 			send_data_to_clients(curelem->data, curelem->len);
 			prev = curelem;
@@ -467,10 +492,18 @@ static void *command_worker(void *arg)
 			r = select(s+1, &readfds, NULL, NULL, &tv);
 			if(r) {
 				received = recv(s, (char*)&cmd+(sizeof(cmd)-left), left, 0);
+				if(received <= 0) {
+					printf("comm recv bye\n");
+					master_connected = 0;
+					if (!enable_data_port)
+						stop_session();
+					pthread_exit(NULL);
+				}
 				left -= received;
 			}
 			if(received == SOCKET_ERROR || do_exit) {
 				printf("comm recv bye\n");
+				master_connected = 0;
 				stop_session();
 				pthread_exit(NULL);
 			}
@@ -944,6 +977,7 @@ int main(int argc, char **argv)
 
 				rlen = sizeof(remote);
 				s = accept(listensocket,(struct sockaddr *)&remote, &rlen);
+				master_connected = 1;
 				break;
 			}
 		}
@@ -973,6 +1007,7 @@ int main(int argc, char **argv)
 		pthread_join(command_thread, &status);
 
 		closesocket(s);
+		master_connected = 0;
 
 		printf("all threads dead..\n");
 		curelem = ll_buffers;
