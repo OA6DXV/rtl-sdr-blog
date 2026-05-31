@@ -24,6 +24,33 @@ BIAS TEE NOTE: Always take care that you do not enable the bias tee when the dev
 
 Note that hack 3) will only work if your system is using this driver. If your system or software is using another driver fork, then the EEPROM information will not be read. So make sure you completely clean your system of the previous drivers first (with the information below) and ensure you run sudo make install after compiling. On Windows, make sure you are using this code's rtlsdr.dll file.
 
+***************************
+OA6DXV Fork Additions
+***************************
+
+This fork keeps the RTL-SDR Blog V4 support from the original rtl-sdr-blog
+tree and adds rtl_tcp improvements intended for unattended SDR server use:
+
+1) Automatic rtl_tcp dongle recovery with the -R flag. If the USB RTL-SDR
+   device disconnects or temporarily loses communication, rtl_tcp can wait for
+   the same dongle to return, reopen it, reapply the configured frequency,
+   sample rate, gain, PPM, direct sampling and bias-T settings, and continue
+   serving clients without manually restarting the process.
+
+2) Optional read-only multi-client I/Q data port with the -l flag. The normal
+   -p port remains the master/control connection used by clients such as WebSDR
+   to set frequency, sample rate and other receiver parameters. The -l port
+   provides a secondary I/Q stream for additional read-only clients, allowing
+   multiple receivers or monitoring tools to consume the same tuned stream
+   without being able to change rtl_tcp settings.
+
+Example:
+
+rtl_tcp -a 0.0.0.0 -d v401 -f 7100.5k -g 8 -p 1230 -s 1400000 -b 10 -R -l 1231
+
+In this example, port 1230 is the master/control port and port 1231 is the
+read-only multi-client data port.
+
 ********************
 Installation (Linux):
 ********************
