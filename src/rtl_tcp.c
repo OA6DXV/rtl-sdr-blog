@@ -298,15 +298,18 @@ static void send_data_to_clients(char *data, size_t len)
 			r = select(data_clients[i]+1, NULL, &writefds, NULL, &tv);
 
 			if (r <= 0) {
-				printf("data client timed out, disconnecting\n");
-				closesocket(data_clients[i]);
-				data_clients[i] = SOCKET_ERROR;
-				removed = 1;
 				break;
 			}
 
 			sent = send(data_clients[i], &data[offset], (int)(len - offset), 0);
 			if (sent <= 0) {
+#ifdef _WIN32
+				if (WSAGetLastError() == WSAEWOULDBLOCK)
+					break;
+#else
+				if (errno == EAGAIN || errno == EWOULDBLOCK)
+					break;
+#endif
 				printf("data client socket bye\n");
 				closesocket(data_clients[i]);
 				data_clients[i] = SOCKET_ERROR;
