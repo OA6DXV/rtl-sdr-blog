@@ -480,9 +480,9 @@ static int device_is_alive(void)
 static void recovery_sleep(void)
 {
 #ifdef _WIN32
-	Sleep(2000);
+	Sleep(5000);
 #else
-	usleep(2000000);
+	usleep(5000000);
 #endif
 }
 
@@ -732,7 +732,14 @@ int main(int argc, char **argv)
 			r = select(listensocket+1, &readfds, NULL, NULL, &tv);
 			if(shutdown_requested) {
 				goto out;
-			} else if(r) {
+			}
+
+			if (enable_reconnect && !shutdown_requested && dev && !device_is_alive()) {
+				if (reconnect_device(direct_sampling, ppm_error, samp_rate, frequency, gain, enable_biastee) < 0)
+					goto out;
+			}
+
+			else if(r) {
 				rlen = sizeof(remote);
 				s = accept(listensocket,(struct sockaddr *)&remote, &rlen);
 				break;
