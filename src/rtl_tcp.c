@@ -277,7 +277,8 @@ static void send_data_to_clients(char *data, size_t len)
 {
 	fd_set writefds;
 	struct timeval tv;
-	int i, r, sent, new_count;
+	size_t offset;
+	int i, r, sent, new_count, removed;
 
 	if (!enable_data_port || data_client_count <= 0)
 		return;
@@ -285,23 +286,39 @@ static void send_data_to_clients(char *data, size_t len)
 	pthread_mutex_lock(&clients_mutex);
 
 	for (i = 0; i < data_client_count; i++) {
-		tv.tv_sec = 0;
-		tv.tv_usec = 10000;
+		offset = 0;
+		removed = 0;
 
-		FD_ZERO(&writefds);
-		FD_SET(data_clients[i], &writefds);
-		r = select(data_clients[i]+1, NULL, &writefds, NULL, &tv);
+		while (offset < len) {
+			tv.tv_sec = 0;
+			tv.tv_usec = 10000;
 
-		if (r > 0) {
-			sent = send(data_clients[i], data, (int)len, 0);
-			if (sent == SOCKET_ERROR || (size_t)sent != len) {
+			FD_ZERO(&writefds);
+			FD_SET(data_clients[i], &writefds);
+			r = select(data_clients[i]+1, NULL, &writefds, NULL, &tv);
+
+			if (r <= 0) {
+				printf("data client timed out, disconnecting\n");
 				closesocket(data_clients[i]);
 				data_clients[i] = SOCKET_ERROR;
+				removed = 1;
+				break;
 			}
-		} else {
-			closesocket(data_clients[i]);
-			data_clients[i] = SOCKET_ERROR;
+
+			sent = send(data_clients[i], &data[offset], (int)(len - offset), 0);
+			if (sent <= 0) {
+				printf("data client socket bye\n");
+				closesocket(data_clients[i]);
+				data_clients[i] = SOCKET_ERROR;
+				removed = 1;
+				break;
+			}
+
+			offset += sent;
 		}
+
+		if (removed)
+			printf("data clients remaining: %d\n", data_client_count - 1);
 	}
 
 	new_count = 0;
