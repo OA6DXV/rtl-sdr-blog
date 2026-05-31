@@ -26,8 +26,6 @@
 #ifndef _WIN32
 #include <unistd.h>
 #include <arpa/inet.h>
-#include <ctype.h>
-#include <dirent.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -35,7 +33,6 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <fcntl.h>
-#include <limits.h>
 #else
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -79,7 +76,6 @@ typedef struct {
 	SOCKET socket;
 	char host[NI_MAXHOST];
 	char port[NI_MAXSERV];
-	char process[128];
 } data_client_t;
 
 static pthread_mutex_t clients_mutex;
@@ -235,167 +231,12 @@ static void set_socket_nonblock(SOCKET socket)
 #endif
 }
 
-#ifndef _WIN32
-static int is_numeric_name(const char *name)
-{
-	while (*name) {
-		if (!isdigit((unsigned char)*name))
-			return 0;
-		name++;
-	}
-
-	return 1;
-}
-
-static int find_peer_inode_ipv4(struct sockaddr_in *local,
-				struct sockaddr_in *peer,
-				unsigned long long *inode)
-{
-	FILE *fp;
-	char line[512];
-	char local_hex[64], remote_hex[64];
-	unsigned int local_addr, remote_addr, local_port, remote_port, state;
-	unsigned long long entry_inode;
-
-	fp = fopen("/proc/net/tcp", "r");
-	if (!fp)
-		return -1;
-
-	if (!fgets(line, sizeof(line), fp)) {
-		fclose(fp);
-		return -1;
-	}
-
-	while (fgets(line, sizeof(line), fp)) {
-		if (sscanf(line, " %*d: %63[0-9A-Fa-f]:%x %63[0-9A-Fa-f]:%x %x %*s %*s %*s %*s %*u %*u %llu",
-			   local_hex, &local_port, remote_hex, &remote_port,
-			   &state, &entry_inode) != 6)
-			continue;
-
-		if (sscanf(local_hex, "%x", &local_addr) != 1 ||
-		    sscanf(remote_hex, "%x", &remote_addr) != 1)
-			continue;
-
-		if (local_addr == peer->sin_addr.s_addr &&
-		    local_port == ntohs(peer->sin_port) &&
-		    remote_addr == local->sin_addr.s_addr &&
-		    remote_port == ntohs(local->sin_port)) {
-			*inode = entry_inode;
-			fclose(fp);
-			return 0;
-		}
-	}
-
-	fclose(fp);
-	return -1;
-}
-
-static int read_process_name(const char *pid, char *process, size_t process_len)
-{
-	FILE *fp;
-	char path[PATH_MAX];
-	char name[96];
-	size_t len;
-
-	snprintf(path, sizeof(path), "/proc/%s/comm", pid);
-	fp = fopen(path, "r");
-	if (!fp)
-		return -1;
-
-	if (!fgets(name, sizeof(name), fp)) {
-		fclose(fp);
-		return -1;
-	}
-	fclose(fp);
-
-	len = strlen(name);
-	if (len > 0 && name[len - 1] == '\n')
-		name[len - 1] = '\0';
-
-	snprintf(process, process_len, "%s/%s", pid, name);
-	return 0;
-}
-
-static int find_process_by_socket_inode(unsigned long long inode,
-					char *process, size_t process_len)
-{
-	DIR *proc_dir, *fd_dir;
-	struct dirent *proc_ent, *fd_ent;
-	char fd_dir_path[PATH_MAX], fd_path[PATH_MAX], link_target[128];
-	char inode_target[64];
-	ssize_t link_len;
-
-	snprintf(inode_target, sizeof(inode_target), "socket:[%llu]", inode);
-
-	proc_dir = opendir("/proc");
-	if (!proc_dir)
-		return -1;
-
-	while ((proc_ent = readdir(proc_dir)) != NULL) {
-		if (!is_numeric_name(proc_ent->d_name))
-			continue;
-
-		snprintf(fd_dir_path, sizeof(fd_dir_path), "/proc/%s/fd", proc_ent->d_name);
-		fd_dir = opendir(fd_dir_path);
-		if (!fd_dir)
-			continue;
-
-		while ((fd_ent = readdir(fd_dir)) != NULL) {
-			snprintf(fd_path, sizeof(fd_path), "%s/%s", fd_dir_path, fd_ent->d_name);
-			link_len = readlink(fd_path, link_target, sizeof(link_target) - 1);
-			if (link_len < 0)
-				continue;
-
-			link_target[link_len] = '\0';
-			if (!strcmp(link_target, inode_target)) {
-				closedir(fd_dir);
-				closedir(proc_dir);
-				return read_process_name(proc_ent->d_name, process, process_len);
-			}
-		}
-
-		closedir(fd_dir);
-	}
-
-	closedir(proc_dir);
-	return -1;
-}
-#endif
-
-static void get_local_peer_process(SOCKET socket, char *process, size_t process_len)
-{
-#ifndef _WIN32
-	struct sockaddr_storage local, peer;
-	socklen_t local_len = sizeof(local);
-	socklen_t peer_len = sizeof(peer);
-	unsigned long long inode;
-
-	process[0] = '\0';
-
-	if (getsockname(socket, (struct sockaddr *)&local, &local_len) ||
-	    getpeername(socket, (struct sockaddr *)&peer, &peer_len))
-		return;
-
-	if (local.ss_family != AF_INET || peer.ss_family != AF_INET)
-		return;
-
-	if (find_peer_inode_ipv4((struct sockaddr_in *)&local,
-				 (struct sockaddr_in *)&peer, &inode))
-		return;
-
-	find_process_by_socket_inode(inode, process, process_len);
-#else
-	process[0] = '\0';
-#endif
-}
-
 static void add_data_client(SOCKET client, struct sockaddr *remote, socklen_t rlen)
 {
 	data_client_t *new_clients;
 	int r, sndbuf;
 	char host[NI_MAXHOST] = "unknown";
 	char port[NI_MAXSERV] = "unknown";
-	char process[128] = "";
 
 	r = getnameinfo(remote, rlen, host, NI_MAXHOST, port, NI_MAXSERV,
 			NI_NUMERICSERV | NI_NUMERICHOST);
@@ -404,7 +245,6 @@ static void add_data_client(SOCKET client, struct sockaddr *remote, socklen_t rl
 
 	sndbuf = DATA_CLIENT_SNDBUF_BYTES;
 	setsockopt(client, SOL_SOCKET, SO_SNDBUF, (char *)&sndbuf, sizeof(sndbuf));
-	get_local_peer_process(client, process, sizeof(process));
 	set_socket_nonblock(client);
 
 	pthread_mutex_lock(&clients_mutex);
@@ -427,8 +267,6 @@ static void add_data_client(SOCKET client, struct sockaddr *remote, socklen_t rl
 		 sizeof(data_clients[data_client_count].host), "%s", host);
 	snprintf(data_clients[data_client_count].port,
 		 sizeof(data_clients[data_client_count].port), "%s", port);
-	snprintf(data_clients[data_client_count].process,
-		 sizeof(data_clients[data_client_count].process), "%s", process);
 	data_client_count++;
 
 	r = send(client, (const char *)&dongle_info, (int)sizeof(dongle_info), 0);
@@ -436,10 +274,8 @@ static void add_data_client(SOCKET client, struct sockaddr *remote, socklen_t rl
 		printf("failed to send dongle information to data client %s:%s\n",
 		       host, port);
 
-	printf("data client accepted from %s:%s%s%s%s! total: %d\n",
-	       host, port, process[0] ? " (" : "",
-	       process[0] ? process : "", process[0] ? ")" : "",
-	       data_client_count);
+	printf("data client accepted from %s:%s! total: %d\n",
+	       host, port, data_client_count);
 	pthread_mutex_unlock(&clients_mutex);
 }
 
@@ -498,11 +334,8 @@ static void send_data_to_clients(char *data, size_t len)
 				if (errno == EAGAIN || errno == EWOULDBLOCK)
 					break;
 #endif
-				printf("data client %s:%s%s%s%s socket bye\n",
-				       data_clients[i].host, data_clients[i].port,
-				       data_clients[i].process[0] ? " (" : "",
-				       data_clients[i].process[0] ? data_clients[i].process : "",
-				       data_clients[i].process[0] ? ")" : "");
+				printf("data client %s:%s socket bye\n",
+				       data_clients[i].host, data_clients[i].port);
 				closesocket(data_clients[i].socket);
 				data_clients[i].socket = SOCKET_ERROR;
 				removed = 1;
@@ -513,11 +346,8 @@ static void send_data_to_clients(char *data, size_t len)
 		}
 
 		if (removed)
-			printf("data clients remaining after %s:%s%s%s%s disconnected: %d\n",
+			printf("data clients remaining after %s:%s disconnected: %d\n",
 			       data_clients[i].host, data_clients[i].port,
-			       data_clients[i].process[0] ? " (" : "",
-			       data_clients[i].process[0] ? data_clients[i].process : "",
-			       data_clients[i].process[0] ? ")" : "",
 			       data_client_count - 1);
 	}
 
@@ -956,7 +786,6 @@ int main(int argc, char **argv)
 	char portinfo[NI_MAXSERV];
 	char remhostinfo[NI_MAXHOST];
 	char remportinfo[NI_MAXSERV];
-	char remprocessinfo[128];
 	int aiErr;
 	int client_index;
 	uint32_t buf_num = 0;
@@ -1219,12 +1048,7 @@ int main(int argc, char **argv)
 		getnameinfo((struct sockaddr *)&remote, rlen,
 			    remhostinfo, NI_MAXHOST,
 			    remportinfo, NI_MAXSERV, NI_NUMERICSERV);
-		get_local_peer_process(s, remprocessinfo, sizeof(remprocessinfo));
-		printf("client accepted! %s %s%s%s%s\n",
-		       remhostinfo, remportinfo,
-		       remprocessinfo[0] ? " (" : "",
-		       remprocessinfo[0] ? remprocessinfo : "",
-		       remprocessinfo[0] ? ")" : "");
+		printf("client accepted! %s %s\n", remhostinfo, remportinfo);
 
 		refresh_dongle_info();
 
