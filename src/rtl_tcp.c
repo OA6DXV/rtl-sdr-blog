@@ -199,6 +199,12 @@ static void stop_session(void)
 #endif
 	do_exit = 1;
 	rtlsdr_cancel_async(dev);
+	/* Wake tcp_worker immediately if it is waiting for the next USB buffer.
+	 * Without this signal, replacing a master can take the full five-second
+	 * condition timeout even though the acquisition was already cancelled. */
+	pthread_mutex_lock(&ll_mutex);
+	pthread_cond_broadcast(&cond);
+	pthread_mutex_unlock(&ll_mutex);
 }
 
 static void refresh_dongle_info(void)
@@ -361,20 +367,6 @@ static void send_data_to_clients(char *data, size_t len)
 	pthread_mutex_unlock(&clients_mutex);
 }
 
-static int has_data_clients(void)
-{
-	int has_clients;
-
-	if (!enable_data_port)
-		return 0;
-
-	pthread_mutex_lock(&clients_mutex);
-	has_clients = data_client_count > 0;
-	pthread_mutex_unlock(&clients_mutex);
-
-	return has_clients;
-}
-
 static void send_data_to_master(char *data, size_t len)
 {
 	int bytesleft, bytessent, index;
@@ -400,11 +392,11 @@ static void send_data_to_master(char *data, size_t len)
 			if(bytessent <= 0) {
 				printf("worker socket bye\n");
 				master_connected = 0;
-				if (!has_data_clients()) {
-					stop_session();
-					pthread_exit(NULL);
-				}
-				break;
+				/* End the acquisition session even when read-only data
+				 * clients are connected.  Their sockets stay open and are
+				 * reused after the replacement master is accepted. */
+				stop_session();
+				pthread_exit(NULL);
 			}
 			bytesleft -= bytessent;
 			index += bytessent;
@@ -412,11 +404,8 @@ static void send_data_to_master(char *data, size_t len)
 		if(bytessent == SOCKET_ERROR || do_exit) {
 			printf("worker socket bye\n");
 			master_connected = 0;
-			if (!has_data_clients()) {
-				stop_session();
-				pthread_exit(NULL);
-			}
-			break;
+			stop_session();
+			pthread_exit(NULL);
 		}
 	}
 }
@@ -474,14 +463,23 @@ static void *tcp_worker(void *arg)
 	int r = 0;
 
 	while(1) {
-		if(do_exit)
-			pthread_exit(0);
-
 		pthread_mutex_lock(&ll_mutex);
+		if(do_exit) {
+			pthread_mutex_unlock(&ll_mutex);
+			pthread_exit(0);
+		}
+
 		gettimeofday(&tp, NULL);
 		ts.tv_sec  = tp.tv_sec+5;
 		ts.tv_nsec = tp.tv_usec * 1000;
-		r = pthread_cond_timedwait(&cond, &ll_mutex, &ts);
+		while (!do_exit && ll_buffers == NULL && r != ETIMEDOUT)
+			r = pthread_cond_timedwait(&cond, &ll_mutex, &ts);
+
+		if(do_exit) {
+			pthread_mutex_unlock(&ll_mutex);
+			pthread_exit(0);
+		}
+
 		if(r == ETIMEDOUT) {
 			pthread_mutex_unlock(&ll_mutex);
 			printf("worker cond timeout\n");
@@ -491,6 +489,7 @@ static void *tcp_worker(void *arg)
 
 		curelem = ll_buffers;
 		ll_buffers = 0;
+		r = 0;
 		pthread_mutex_unlock(&ll_mutex);
 
 		while(curelem != 0) {
@@ -556,8 +555,11 @@ static void *command_worker(void *arg)
 				if(received <= 0) {
 					printf("comm recv bye\n");
 					master_connected = 0;
-					if (!has_data_clients())
-						stop_session();
+					/* A live data-port client must not keep the old
+					 * acquisition session pinned.  Stop only the session;
+					 * the outer loop preserves data clients and accepts a
+					 * replacement master. */
+					stop_session();
 					pthread_exit(NULL);
 				}
 				left -= received;

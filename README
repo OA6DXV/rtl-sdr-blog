@@ -44,12 +44,25 @@ tree and adds rtl_tcp improvements intended for unattended SDR server use:
    multiple receivers or monitoring tools to consume the same tuned stream
    without being able to change rtl_tcp settings.
 
+3) Master reconnection while read-only clients remain connected. If the
+   master/control client disconnects, rtl_tcp ends only the current acquisition
+   session, keeps the read-only client sockets open, accepts a replacement
+   master and resumes streaming. This prevents the master listen backlog from
+   becoming stuck when a WebSDR service is restarted while another receiver is
+   consuming the -l stream.
+
 Example:
 
 rtl_tcp -a 0.0.0.0 -d v401 -f 7100.5k -g 8 -p 1230 -s 1400000 -b 10 -R -l 1231
 
 In this example, port 1230 is the master/control port and port 1231 is the
 read-only multi-client data port.
+
+Hardware regression test for master replacement (use disposable ports and stop
+any service that owns the selected dongle first):
+
+rtl_tcp -a 127.0.0.1 -d v401 -p 2230 -l 2231 -s 1024000
+python3 tests/test_rtl_tcp_master_reconnect.py --master-port 2230 --data-port 2231
 
 ********************
 Installation (Linux):
